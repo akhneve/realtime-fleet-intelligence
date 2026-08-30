@@ -1,0 +1,47 @@
+name: ingest-live-gbfs
+
+on:
+  schedule:
+    - cron: "0 9,21 * * *"
+      timezone: "America/Los_Angeles"
+  workflow_dispatch:
+
+concurrency:
+  group: live-gbfs-ingestion
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - run: python -m pytest
+
+      - run: python -m src.main
+        env:
+          GBFS_URL: ${{ secrets.GBFS_URL }}
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_PORT: ${{ secrets.DB_PORT }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          DETAIL_RETENTION_DAYS: "3"
+          REJECTED_RETENTION_DAYS: "3"
+          FEED_STALE_MINUTES: ${{ secrets.FEED_STALE_MINUTES }}
+          VOLUME_DROP_THRESHOLD: ${{ secrets.VOLUME_DROP_THRESHOLD }}
+          VOLUME_DROP_POLICY: ${{ secrets.VOLUME_DROP_POLICY }}
+          SEATTLE_BBOX_MIN_LAT: ${{ secrets.SEATTLE_BBOX_MIN_LAT }}
+          SEATTLE_BBOX_MAX_LAT: ${{ secrets.SEATTLE_BBOX_MAX_LAT }}
+          SEATTLE_BBOX_MIN_LON: ${{ secrets.SEATTLE_BBOX_MIN_LON }}
+          SEATTLE_BBOX_MAX_LON: ${{ secrets.SEATTLE_BBOX_MAX_LON }}
+          GRID_SIZE_DEGREES: ${{ secrets.GRID_SIZE_DEGREES }}
+          REBALANCE_HIGH_THRESHOLD: ${{ secrets.REBALANCE_HIGH_THRESHOLD }}
+          REBALANCE_MEDIUM_THRESHOLD: ${{ secrets.REBALANCE_MEDIUM_THRESHOLD }}
