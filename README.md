@@ -1,354 +1,334 @@
 # Real-Time Fleet Operations Intelligence
 
-This repository is a small, end-to-end data system for observing Lime's Seattle
-micromobility fleet. Every run downloads the current public GBFS vehicle feed,
-checks whether the data is usable, converts it into a stable internal shape,
-stores it in PostgreSQL, and exposes reporting views that Power BI can query.
+This repository is a production-oriented data pipeline for observing Lime's Seattle micromobility fleet. Every 15 minutes it downloads all four configured GBFS feeds (`system_information`, `station_information`, `station_status`, and `free_bike_status`), validates and transforms them into stable internal models, writes PostgreSQL atomically, and exposes Power BI-compatible reporting views.
 
-The system is a **scheduled snapshot pipeline**, not streaming. A scheduled job
-takes a fresh snapshot twice daily at 9:00 AM and 9:00 PM Pacific Time. That
-distinction matters: the source publishes the state visible at one moment, not a
-continuous event for every trip or movement.
+The system is near-real-time availability reporting. It observes system metadata, station supply, operating flags, and free vehicles published at discrete moments; it does not receive trip events, prove demand, or continuously track movement.
 
-## Why This System Exists
+## The Problem, From First Principles
 
-A raw API response is useful to a program, but it is not yet trustworthy or
-convenient for an operations dashboard. Several problems have to be solved first:
+The source APIs describe the Lime system, its stations, station-level supply, and each currently reported free vehicle. A production dashboard needs more than those raw JSON responses.
 
-1. The source can be unavailable, slow, malformed, stale, or unexpectedly small.
-2. Individual records can have missing IDs, invalid coordinates, or duplicates.
-3. Field names used by the source should not leak into every downstream report.
-4. An operations dashboard needs the latest observed state, while trend analysis needs history.
-5. Detailed history grows too quickly to retain forever in a small database.
-6. Failed runs and rejected records must remain visible instead of disappearing.
+Before the feed can support operational decisions, the system must solve several separate problems:
 
-This repository addresses those problems as one pipeline:
+1. **Networks are unreliable.** Requests can time out, receive rate limits, or fail with temporary server errors.
+2. **Source data is untrusted input.** A response can be malformed, stale, unexpectedly empty, duplicated, or contain impossible coordinates.
+3. **Source schemas evolve.** GBFS v2 calls the collection `bikes`; GBFS v3 calls it `vehicles`. Downstream reports should not know or care which source alias was used.
+4. **Related feeds have different grains.** Singleton system metadata, station definitions, station status, and free vehicles cannot be forced into one record shape without losing meaning.
+5. **Current state and history have different jobs.** Operators need the latest vehicle and station state quickly, while analysts need historical trends without scanning millions of raw rows.
+6. **Partial writes are misleading.** A dashboard must never show one feed from a new run while related state, aggregates, or quality metadata still represent an older run.
+7. **Bad data must remain explainable.** Rejecting a record silently makes failures impossible to investigate, and a rejection must identify which feed produced it.
+8. **Storage is finite.** Vehicle detail grows much faster than station or grid history, so each data product needs an appropriate retention period.
+9. **Production access must be limited.** The ingestion job needs write access; Power BI needs read access; neither needs schema-owner privileges.
+10. **Failures are part of the product.** Operators need pipeline-level and endpoint-level evidence of failed, warning, and successful runs—not merely the successful data.
+
+The repository separates these concerns so each rule has one owner and can be tested independently.
+
+## The System in One Picture
 
 ```text
-Lime Seattle GBFS API
-        |
-        | HTTPS JSON snapshot
-        v
-extract -> validate -> assess quality -> transform
-        |
-        | one PostgreSQL transaction
-        v
-current state + recent detail + 15-minute aggregates + audit records
-        |
-        | reporting views
-        v
-Power BI DirectQuery
+Four Lime GBFS HTTPS feeds
+             |
+             v
+      extract with bounded retries
+             |
+             v
+   validate + normalize + quarantine
+             |
+             v
+ snapshot-level quality assessment
+             |
+             v
+ transform to typed system, station, and vehicle records
+             |
+             | one PostgreSQL transaction
+             v
+ system/station state + vehicle state + histories
+       + rejected records + per-feed run evidence
+             |
+             v
+ stable SQL reporting views -> Power BI
 ```
 
-GitHub Actions supplies the Pacific-time-aware clock that starts this process at
-9:00 AM and 9:00 PM each day.
-PostgreSQL is the system of record. Power BI is deliberately the presentation
-layer, not the place where source data is cleaned or core business rules are
-reimplemented.
+GitHub Actions provides the clock and runs the ingestion command every 15 minutes. PostgreSQL is the system of record. Power BI is a presentation consumer: it does not clean source data or redefine business rules.
 
-## How One Run Works
+## What Happens During One Run
 
-The executable entry point is `python -m src.main`. One run proceeds as follows:
+The production entry point is `fleet-ingest`. One invocation performs the following sequence:
 
-1. `src/config.py` loads `.env` and validates configuration.
-2. `src/load.py` opens PostgreSQL and reads recent normal record volumes.
-3. `src/extract.py` requests the current GBFS JSON with timeout and retry logic.
-4. `src/validate.py` checks the payload and separates accepted and rejected rows.
-5. `src/metrics.py` fails empty snapshots and detects missing/stale timestamps or
-   an unusual drop in vehicle count without allowing warnings to downgrade failures.
-6. `src/transform.py` creates stable database rows and geographic grid IDs.
-7. `src/load.py` transactionally writes detail, synchronizes the full current
-   snapshot, replaces affected aggregate buckets, updates reporting thresholds,
-   quarantines rejected rows, applies retention, and records the run.
-8. `src/main.py` updates the run record after commit so pipeline duration includes
-   extraction, processing, database writes, and retention work.
+1. Load and validate pipeline configuration.
+2. Load database configuration only because this is a production run; dry runs do not require database credentials.
+3. Open a TLS-required PostgreSQL connection and read the recent valid-record baseline.
+4. Fetch all four GBFS documents through one reusable HTTP session with separate connection/read timeouts and bounded exponential backoff.
+5. Validate system metadata, station definitions, station statuses, and either GBFS v2 `data.bikes` or GBFS v3 `data.vehicles`.
+6. Normalize IDs and aliases, reject malformed station/vehicle records, and reject every copy of duplicate normalized IDs.
+7. Assess timestamp freshness and zero-record protection across all feeds, plus vehicle volume-drop quality.
+8. Derive availability, deterministic geographic grid IDs, timestamps, and run lineage for every dataset.
+9. Copy accepted vehicles into a temporary PostgreSQL staging table once; the much smaller system and station sets use parameterized upserts.
+10. Use set-based SQL to write current state and history for all four feeds, replace the affected grid bucket, store feed-tagged rejections and per-feed metrics, apply retention, and write the run record.
+11. Commit all reporting changes together. If any database operation fails, PostgreSQL rolls the transaction back.
+12. Update the run's final duration so observability includes database work.
 
-The process exits with a nonzero status on failure. That status is how GitHub
-Actions knows to mark a scheduled run as failed.
+A `SUCCESS` or `WARNING` snapshot updates operational state. A `FAILED` quality snapshot remains auditable but cannot replace current state or long-term aggregates. Exceptions and failed-quality runs return a nonzero process status so the scheduler marks the run as failed.
 
-## Repository Map: Why Every File Is Here
+## Four-Feed Source Contract
+
+Each endpoint keeps its native grain through validation and transformation. The loader combines them only at the transaction boundary:
+
+| Feed | Expected source shape | Normalized content | Database destination |
+|---|---|---|---|
+| `system_information` | Singleton object in `data` | Required system ID, name, language, and timezone; optional license URL and attribution organization. | `system_information`, replaced as the authoritative current system record. |
+| `station_information` | `data.stations[]` | Station ID, name, optional short name/region/capacity, and finite coordinates. Duplicate IDs, invalid coordinates, and optional bounding-box violations are quarantined. | `station_information`, reconciled as the authoritative current station dimension. |
+| `station_status` | `data.stations[]` | Station ID, non-negative vehicle/dock counts, installed/renting/returning flags, and optional `last_reported`. Both `num_vehicles_available` and the older `num_bikes_available` alias are accepted. | `current_station_status` for operations and `fact_station_status_snapshot` for history. |
+| `free_bike_status` | GBFS v2 `data.bikes[]` or v3 `data.vehicles[]` | Vehicle ID, type, finite coordinates, reservation state, disabled state, derived availability, and deterministic grid ID. | `current_vehicle_state`, `fact_vehicle_snapshot`, and the derived `fact_grid_15min` aggregate. |
+
+All endpoint URLs must be absolute HTTPS URLs. Extraction reuses one HTTP session but records latency, HTTP status, source timestamp, source URL, counts, and observed keys independently for each feed in `feed_run_metrics`. A failure identifies the feed by name and aborts the four-feed refresh.
+
+## Why the Database Has Several Tables
+
+One table cannot efficiently represent every grain of information:
+
+| Object | Grain | Why it exists | Place in the system |
+|---|---|---|---|
+| `current_vehicle_state` | One row per currently reported vehicle | Makes current maps and counts fast without searching history. | Operational read model replaced by each usable full snapshot. |
+| `fact_vehicle_snapshot` | One vehicle per ingestion run | Preserves short-lived forensic detail for debugging recent changes. | Detailed history retained for 24 hours by default. |
+| `fact_grid_15min` | One grid per 15-minute bucket | Stores compact trends and makes multi-week baselines affordable. | Analytical history retained for 35 days by default. |
+| `system_information` | One currently reported system | Stores operator identity, language, timezone, licensing, and attribution metadata. | Current reference data refreshed by each usable run. |
+| `station_information` | One currently reported station | Stores names, coordinates, capacity, and other station reference fields. | Authoritative current station dimension. |
+| `current_station_status` | One latest status per station | Makes station supply and operating flags fast to query. | Operational station read model. |
+| `fact_station_status_snapshot` | One station status per ingestion run | Preserves station-level supply, flags, source/report times, lineage, and quality. | Historical station fact retained for `AGGREGATE_RETENTION_DAYS`, 35 days by default. |
+| `feed_run_metrics` | One feed per ingestion run | Preserves each endpoint's URL, latency, HTTP status, source timestamp, received/valid/rejected counts, and observed schema. | Per-feed observability linked to `pipeline_runs` and removed with its retained parent run. |
+| `rejected_records` | One rejected station or vehicle record | Keeps the original bad input, source feed name, record key, and machine/human-readable reasons. | Feed-aware data-quality quarantine retained for 14 days by default. |
+| `pipeline_runs` | One four-feed ingestion attempt | Records end-to-end timing, vehicle-scoped counts/schema, combined endpoint latency, overall quality, and errors. | Backward-compatible pipeline evidence retained for 90 days by default. |
+| `reporting_thresholds` | One named threshold | Lets reporting logic use controlled operational settings. | Configuration bridge between environment settings and SQL views. |
+
+The same run is intentionally represented at different grains. Current-state tables optimize “what is true now?”, detail facts optimize investigation, grid aggregates optimize longer trends, and the run tables separate whole-pipeline health from individual endpoint health.
+
+`pipeline_runs.records_received`, `records_valid`, `records_rejected`, and `observed_schema_keys` deliberately remain vehicle-scoped so the original count invariant and historical dashboards remain compatible. `pipeline_runs.api_latency_ms` is the sum of the four endpoint latencies. Use `feed_run_metrics` whenever an operator needs feed-specific counts, schemas, timestamps, or latency.
+
+## Repository Map: Why Every File Exists
 
 ### Root files
 
-| File | What it does | Why it is needed | Place in the system |
+| File | What it does | Why it is needed | Where it fits |
 |---|---|---|---|
-| `README.md` | Documents the system, setup, operation, and design. | A data pipeline is not maintainable if a new person cannot reconstruct how its pieces interact. | Human entry point to the repository. |
-| `requirements.txt` | Pins every direct third-party dependency: `requests`, `psycopg` with its binary driver, and `pytest`. | Python must install compatible HTTP, PostgreSQL, and test libraries in local and CI environments; pip installs their transitive dependencies automatically. | Reproducible runtime and test environment. |
-| `.env.example` | Lists every supported setting without real credentials. | It defines the configuration contract while keeping secrets out of Git. | Template for local configuration and GitHub secrets. |
-| `.gitignore` | Excludes `.env`, virtual environments, bytecode, and caches. | Credentials and generated machine-specific files must not enter version control. | Repository hygiene and secret protection. |
-| `.env` | Holds this machine's actual local settings and database credentials. | Local commands need configuration without repeatedly setting shell variables. | Loaded automatically by `src/config.py`; intentionally ignored by Git. |
+| `README.md` | Explains the problem, architecture, setup, repository contents, and supported behavior. | Code alone cannot communicate system intent or operational boundaries to a new engineer. | Primary human entry point. |
+| `pyproject.toml` | Defines the version `1.1.0` multi-feed package, Python compatibility, console commands, direct dependencies, package discovery, and Ruff/Mypy/pytest/coverage configuration. | Python tooling needs one machine-readable project contract instead of unrelated command-line conventions. | Build, installation, and quality-tool control plane. |
+| `requirements.txt` | Pins direct runtime dependencies used by the application. | Makes the small runtime dependency surface explicit and easy to audit. | Human-readable runtime dependency manifest synchronized with `pyproject.toml`. |
+| `requirements.lock` | Pins the fully resolved runtime environment, including transitive dependencies. | A scheduled job should install the same versions on every runner rather than resolving a different environment over time. | Reproducible production and scheduled-workflow installation. |
+| `requirements-dev.txt` | Adds Mypy, pytest, coverage, and Ruff to the runtime requirements. | Contributors need development tools that production does not need. | Human-readable local development dependency manifest. |
+| `requirements-dev.lock` | Pins the complete resolved development and CI environment. | CI and local verification must use predictable tool versions. | Reproducible quality-gate installation. |
+| `.env.example` | Lists the four explicit Lime endpoint settings plus database, retention, quality, bounding-box, grid, and reporting settings with safe defaults. | It documents the expanded configuration interface without exposing credentials. | Template for local `.env` and GitHub secrets. |
+| `.gitignore` | Excludes secrets, virtual environments, bytecode, build output, coverage data, test output, tool caches, and the local Power BI workspace. | Machine-specific, binary, and generated files create noise, cannot be reviewed usefully as text diffs, and can leak connection metadata. | Repository hygiene and secret-protection boundary. |
 
-### Automation
+### Local-only artifacts
 
-| File | What it does | Why it is needed | Place in the system |
+These paths are part of a developer's working system but are intentionally ignored by Git:
+
+| Path | What it does | Why it is local-only | Where it fits |
 |---|---|---|---|
-| `.github/workflows/ingest.yml` | Creates Python on a GitHub runner, installs dependencies, runs tests, then runs ingestion at 9:00 AM and 9:00 PM Pacific or on demand. | The pipeline needs an external scheduler and failures need a visible execution history. | Production orchestration; GitHub secrets become environment variables here. |
+| `.env` | Holds real local endpoint and database settings. | It contains credentials and deployment-specific values that must never be committed. | Local configuration source loaded by `config.py`. |
+| `.venv/` | Contains the installed Python interpreter environment and dependencies. | It is large, platform-specific, and reproducible from the lock files. | Local execution environment, not source code. |
+| `PBI/Fleet Intellegence Dashboard.pbix` | Contains the Power BI Desktop dashboard that presents fleet and pipeline views. | PBIX is a binary, environment-bound authoring artifact that is not meaningfully mergeable and may retain connection metadata. | Presentation layer consuming the stable SQL reporting contract. |
+| `__pycache__/`, `*.pyc`, and tool-cache folders | Store generated bytecode and analysis/test caches. | Python and the quality tools recreate them automatically; retaining them would only record machine state. | Local performance artifacts with no architectural responsibility. |
+
+### GitHub automation
+
+| File | What it does | Why it is needed | Where it fits |
+|---|---|---|---|
+| `.github/workflows/ci.yml` | Runs formatting, linting, strict typing, coverage-enforced tests, and PostgreSQL integration tests on Python 3.12 and 3.13. | A change should prove deterministic correctness before reaching the scheduled production workflow. | Pull-request and main-branch quality gate. |
+| `.github/workflows/ingest.yml` | Installs runtime-only dependencies, supplies all four endpoint settings and the legacy free-bike override, and executes `fleet-ingest` every 15 minutes or on manual dispatch. | The pipeline needs an external clock, deployment configuration, and visible execution history. | Production scheduler and runtime environment. |
+| `.github/dependabot.yml` | Checks Python and GitHub Actions dependencies weekly and groups related updates. | Exact pins become unsafe if nobody reviews newer security and compatibility releases. | Dependency maintenance automation. |
+
+CI and ingestion are intentionally separate. Tests should be deterministic and run on code changes; live ingestion should be small, fast, and concerned only with one atomic four-feed production snapshot.
+
+### Design and operations documentation
+
+| File | What it does | Why it is needed | Where it fits |
+|---|---|---|---|
+| `docs/architecture.md` | Describes module boundaries, typed contracts, transaction invariants, reporting semantics, and security boundaries. | Maintainers need the reasoning behind boundaries, not just setup commands. | Engineering design reference. |
+| `docs/operations.md` | Documents migrations, role provisioning, deployment checks, sizing, troubleshooting, and rollback. | Operating a data pipeline safely requires procedures that do not belong inside application code. | Production runbook. |
 
 ### Python package
 
-| File | What it does | Why it is needed | Place in the system |
+All runtime code lives under `src/fleet_intelligence`. The `src` layout keeps the import package distinct from the repository root and matches the structure installed into production.
+
+| File | What it does | Why it is needed | Where it fits |
 |---|---|---|---|
-| `src/__init__.py` | Marks `src` as an importable Python package. | Module commands such as `python -m src.main` and relative imports need a package boundary. | Package plumbing. |
-| `src/config.py` | Reads `.env` and environment variables, converts text to typed settings, and rejects missing or invalid configuration. | All modules need one consistent source for URLs, credentials, thresholds, geography, and retention. | First runtime step and configuration boundary. |
-| `src/extract.py` | Calls Lime's GBFS endpoint, retries transient failures, parses JSON, and records HTTP latency. | External networks fail in ordinary ways; extraction must fail clearly and expose useful timing data. | Source boundary: remote JSON enters the system here. |
-| `src/validate.py` | Verifies feed structure and timestamps, normalizes source field names, validates coordinates and state, detects duplicate IDs, and records rejection reasons. | Untrusted source data must not silently corrupt current state or reporting history. | Quality gate between extraction and transformation. |
-| `src/metrics.py` | Evaluates feed freshness and volume anomalies, rounds timestamps to 15-minute buckets, and creates grid aggregates. | Record validity cannot detect a technically valid but suspicious snapshot; compact aggregates also make history affordable. | Snapshot-level quality and analytical aggregation. |
-| `src/transform.py` | Derives availability, assigns deterministic rectangular grid IDs, and adds timestamps, source labels, quality status, and run lineage. | Downstream tables need a stable business shape independent of GBFS naming details. | Converts accepted source records into load-ready records. |
-| `src/load.py` | Connects to PostgreSQL, reads the recent baseline, synchronizes current state, replaces aggregate buckets, updates reporting thresholds, logs runs, and applies retention transactionally. | Database behavior belongs in one module so writes are atomic, parameterized, idempotent, and storage remains bounded. | Persistence boundary between Python and PostgreSQL. |
-| `src/main.py` | Coordinates one complete production run and provides a no-write dry-run mode. | A scheduler needs one command with a clear success or failure exit status. | Application entry point. |
-| `src/self_test.py` | Runs built-in checks against local logic, the live Lime endpoint, the dry pipeline, and the configured PostgreSQL connection. | Unit tests cannot prove that today's external API or credentials work. | Integration and operator diagnostic tool. |
+| `src/fleet_intelligence/__init__.py` | Declares the package and its `1.1.0` version. | Python needs a stable import namespace and a release marker for the multi-feed contract. | Package identity. |
+| `src/fleet_intelligence/__main__.py` | Routes `python -m fleet_intelligence` to the ingestion CLI. | Provides a standard Python module entry point in addition to the installed console command. | Thin command bootstrap; contains no business logic. |
+| `src/fleet_intelligence/models.py` | Defines JSON/feed types and dataclasses for normalized system, station, status, vehicle, rejection, snapshot, aggregate, validation, and run records. | Stages need explicit contracts so missing or misnamed fields are caught by Mypy rather than during a production load. | Shared internal data language used by every pipeline stage. |
+| `src/fleet_intelligence/config.py` | Loads `.env`; validates four HTTPS endpoints, ranges, thresholds, bounding boxes, SSL, and timeouts; exposes a typed feed-name-to-URL map; and keeps `GBFS_URL` as the legacy fallback for `FREE_BIKE_STATUS_URL`. | Invalid configuration must fail before network or database mutation while existing free-bike deployments retain a controlled upgrade path. | Startup boundary between deployment configuration and typed application settings. |
+| `src/fleet_intelligence/extract.py` | Reuses one HTTP session across four feeds, sets the versioned user agent, applies timeouts, retries transient failures, parses JSON, measures each endpoint's latency, and names the failed feed in errors. | External networks fail differently from bad data; only recoverable failures should be retried, and operators must know which endpoint stopped the run. | Source boundary where untrusted remote JSON enters the system. |
+| `src/fleet_intelligence/validate.py` | Applies feed-specific envelopes and types; normalizes system/station/vehicle IDs and aliases; detects duplicate station/vehicle IDs; rejects invalid coordinates, capacities, counts, state, and report time; applies the optional bounding box to stations and vehicles; and tags quarantined rows with their feed. | Downstream code should receive trusted feed-specific models regardless of source-version details. | Data-quality gate and feed-aware quarantine producer. |
+| `src/fleet_intelligence/metrics.py` | Evaluates missing/stale/future timestamps and empty results for every feed, applies volume-drop detection to vehicles, and creates 15-minute grid aggregates. | Valid individual records can still form a suspicious snapshot, and reporting needs compact history. | Snapshot-level quality and analytical aggregation layer. |
+| `src/fleet_intelligence/transform.py` | Converts normalized system, station, status, and vehicle values into immutable database records, derives availability, and assigns deterministic grid IDs. | Business-ready fields should be calculated once instead of reimplemented in SQL or Power BI. | Pure transformation layer between validation and persistence. |
+| `src/fleet_intelligence/load.py` | Opens hardened PostgreSQL connections, stages vehicles with `COPY`, idempotently reconciles system/station/vehicle current state, appends vehicle and station-status facts, writes aggregates/feed metrics/feed-tagged rejections/run evidence, and applies cascading retention in one transaction. | Database mutations must be atomic, parameterized, efficient, and isolated from source parsing. | Persistence boundary and transaction owner. |
+| `src/fleet_intelligence/main.py` | Fetches and validates all four feeds, merges their freshness and completeness into one severity, transforms every dataset, preserves vehicle-scoped legacy metrics, creates four `FeedRunMetric` rows, coordinates production/dry-run flows, sanitizes errors, and implements exit semantics. | A scheduler needs one command that owns sequencing and produces an unambiguous success/failure status without hiding which feed caused a warning. | Application orchestration and `fleet-ingest` implementation. |
+| `src/fleet_intelligence/diagnostics.py` | Performs explicit read-only validation of all four live feeds and checks every required table and new reporting view in the configured database. | Deterministic unit tests cannot prove that today's endpoints, credentials, TLS path, or migration 007 relations are reachable. | Operator-facing `fleet-diagnostics` integration check. |
+| `src/fleet_intelligence/py.typed` | Marks the installed package as providing inline type information. | External type checkers otherwise treat the installed package as untyped even though its code is annotated. | Packaging metadata for PEP 561-compatible type checking. |
 
-### Database definition
+The module order mirrors the data flow: `config -> extract -> validate -> metrics -> transform -> load`, with `models` shared across stages and `main` coordinating them.
 
-These files are intentionally ordered migrations. Run them in numerical order
-against a new Supabase/PostgreSQL database. Existing deployments should rerun
-`002_indexes.sql` and `003_views.sql`, then apply `004_security.sql`; these
-operations are idempotent.
+### SQL migrations
 
-| File | What it does | Why it is needed | Place in the system |
+Migrations are applied in numerical order. They are deliberately separate from runtime startup because schema changes require owner privileges and an explicit operational decision.
+
+| File | What it does | Why it is needed | Where it fits |
 |---|---|---|---|
-| `sql/001_schema.sql` | Creates tables, constraints, keys, and default reporting thresholds. | Python cannot load data until PostgreSQL has a durable, validated storage model. | Physical data model. |
-| `sql/002_indexes.sql` | Adds indexes for current-grid, time-series, rejection, and pipeline-health queries. | Correct tables can still be too slow for repeated DirectQuery access and retention deletes. | Database performance layer. |
-| `sql/003_views.sql` | Creates current fleet, grid supply, historical baseline, rebalancing, trend, and pipeline-health views. | Reports need stable business-facing datasets without duplicating SQL inside Power BI. | Semantic/reporting layer consumed by Power BI. |
-| `sql/004_security.sql` | Removes Supabase API-role access and enables row-level security on operational tables. | Public API roles must not be able to read, rewrite, truncate, or delete fleet data. | Database security boundary. |
+| `sql/001_schema.sql` | Creates extensions, six operational tables, primary keys, basic status constraints, and default reporting thresholds. | Persistence needs a durable physical model before the application can write data. | Initial database foundation. |
+| `sql/002_indexes.sql` | Adds indexes for grid lookups, time filtering, retention deletion, rejection investigation, and pipeline status queries. | Correct SQL can still be operationally unusable if common queries require full-table scans. | Physical database performance layer. |
+| `sql/003_views.sql` | Defines current fleet, current grid, historical baseline, rebalancing, trend, and pipeline-health views. | Power BI needs stable business-facing datasets without duplicating core SQL in each report. | Initial semantic/reporting layer. |
+| `sql/004_security.sql` | Revokes Supabase `anon`/`authenticated` access and enables row-level security on operational tables. | Public API roles must not inherit access to raw operational data accidentally. | Original database security boundary. |
+| `sql/005_production_hardening.sql` | Adds validated coordinate/count/quality constraints and updates baseline/rebalancing views to expose sample readiness and use the latest snapshot's time context. | Application validation is not enough by itself; the database must defend its invariants, and stale snapshots must not be compared with the viewer's wall clock. | Additive integrity and reporting-correctness migration for existing installations. |
+| `sql/006_least_privilege_roles.sql` | Creates non-login ingestion/reporting roles, hardens public/default privileges, grants minimal access, and installs ingestion RLS policies. | Runtime writers and reporting readers require different privileges, while credentials remain deployment-specific. | Additive least-privilege authorization model. |
+| `sql/007_all_lime_gbfs_feeds.sql` | Adds a feed name to quarantined records; creates five system/station/feed-metric tables, station/feed indexes, `vw_current_station_supply`, and `vw_feed_health`; and extends constraints, grants, RLS, and ingest policies. | Existing free-bike deployments need an additive, idempotent path to ingest the other three Lime datasets without rebuilding established vehicle objects. | Four-feed storage, observability, reporting, and security extension. |
 
-Retention is runtime behavior in `src/load.py`, not a schema migration, because
-the retention ages come from configuration and cleanup must run with every
-snapshot transaction.
+The first four migrations remain the compatibility baseline. Existing databases apply 005, 006, and 007 rather than rebuilding tables or changing established Power BI columns.
 
 ### Automated tests
 
-| File | What it does | Why it is needed | Place in the system |
+| File | What it proves | Why it is needed | Where it fits |
 |---|---|---|---|
-| `tests/test_config.py` | Tests `.env` parsing, defaults, overrides, and configuration validation. | A configuration bug can stop the pipeline before it reaches the source or database. | Fast, offline unit coverage for configuration. |
-| `tests/test_load.py` | Tests transaction mode, current-state reconciliation, failed-snapshot isolation, and grid-bucket replacement. | Persistence regressions can otherwise report success while leaving incorrect database state. | Fast, offline unit coverage for loading behavior. |
-| `tests/test_main.py` | Tests orchestration and final end-to-end runtime measurement. | Run metadata must describe the complete pipeline rather than only pre-load work. | Fast, offline coverage for the application entry point. |
-| `tests/test_sql.py` | Guards Seattle-local time semantics, zero-current grid candidates, and required RLS statements. | Reporting and security behavior lives partly in SQL and needs regression coverage. | Static coverage for database definitions. |
-| `tests/test_validate.py` | Tests valid rows and rejection cases such as duplicate IDs, missing IDs, and invalid coordinates. | Validation is the main protection against bad source data. | Fast, offline unit coverage for the quality gate. |
-| `tests/test_transform.py` | Tests availability rules, grid assignment, and transformed metadata. | Derived fields must remain deterministic because database keys and reports depend on them. | Fast, offline unit coverage for transformation. |
+| `tests/test_config.py` | Four endpoint defaults and ordering, legacy `GBFS_URL` compatibility, dotenv precedence, HTTPS/SSL errors, retention, thresholds, bounding boxes, required database values, and password redaction. | Configuration failures occur before all other work and the compatibility fallback must remain deterministic. | Startup/configuration regression coverage. |
+| `tests/test_extract.py` | Headers, four-feed session reuse/closure, successful extraction, retries, permanent errors, malformed JSON, ownership, and feed-named multi-feed errors. | HTTP retry mistakes can either drop recoverable runs or repeatedly hammer a permanently invalid endpoint. | Source-boundary unit coverage. |
+| `tests/test_validate.py` | System identity, station definition/status, vehicle validation, GBFS aliases, duplicates, malformed records, invalid counts/state/coordinates/timestamps, bounding boxes, and feed-tagged quarantine. | Validation is the primary barrier between four untrusted JSON shapes and operational state. | Data-quality regression coverage. |
+| `tests/test_transform.py` | System/station/status/vehicle transformations, lineage, station snapshot fallback, availability, grid determinism, aggregation, freshness, and volume-drop behavior. | Pure business rules should remain deterministic across feed expansion and refactors. | Transformation and metrics unit coverage. |
+| `tests/test_load.py` | TLS/timeouts, vehicle `COPY` staging, idempotent system/station/status/feed-metric SQL, feed-tagged rejections, retention, failed-snapshot isolation, and transactions. | Persistence bugs can silently produce plausible but inconsistent cross-feed dashboards. | Database-boundary unit coverage with recording fakes. |
+| `tests/test_main.py` | Four-feed orchestration and metric creation, related-feed severity escalation, exit statuses, retention propagation, final duration, secret sanitization, connection cleanup, dry-run isolation, and CLI switching. | Orchestration must remain correct when any individual feed or stage fails. | Application-flow regression coverage. |
+| `tests/test_diagnostics.py` | Read-only database behavior, four-feed live validation, empty vehicle failure, CLI target selection, and diagnostic exit status. | Operator tools must not mutate production and must fail clearly when any required dependency is unusable. | Diagnostic-command unit coverage. |
+| `tests/test_sql.py` | Migration ordering through 007, additive constraints, station/feed tables and views, snapshot-time context, baseline readiness, least-privilege roles, and RLS policies. | Important behavior lives in SQL and needs reviewable regression guards even without a database process. | Static migration contract coverage. |
+| `tests/test_automation.py` | All four workflow endpoint variables, the 15-minute schedule, workflow permissions/timeouts, CI Python matrix, PostgreSQL service, coverage gate, and immutable action pins. | Automation configuration is executable production behavior, not incidental YAML. | CI/deployment regression coverage. |
+| `tests/test_postgres_integration.py` | Applies every migration twice, transactionally loads all four normalized datasets and metrics, queries vehicle/station views, verifies constraint rollback, and checks ingestion/reporting privileges. | Fakes cannot prove that PostgreSQL accepts the cross-feed SQL, deferred feed-metric relationship, or role semantics. | Real PostgreSQL integration test, enabled by `TEST_DATABASE_URL`. |
 
-`tests/` and `src/self_test.py` are not duplicates. Pytest uses controlled inputs
-and should be fast and deterministic. The self-test intentionally reaches the
-live API and database, so it answers a different question: whether the complete
-system's external dependencies work right now.
-
-## Database Model From First Principles
-
-One table cannot efficiently serve every use case. The database therefore stores
-the same observation at different levels of detail:
-
-| Database object | Grain | Reason it exists |
-|---|---|---|
-| `current_vehicle_state` | One latest row per vehicle | Fast operational maps and counts without searching history. |
-| `fact_vehicle_snapshot` | One vehicle per ingestion run | Recent forensic detail and short-term vehicle-level analysis. |
-| `fact_grid_15min` | One geographic grid per 15-minute bucket | Compact long-term trends that do not grow at vehicle-level speed. |
-| `rejected_records` | One invalid source record | Data lineage: bad rows remain explainable instead of vanishing. |
-| `pipeline_runs` | One pipeline attempt | Operational evidence of freshness, latency, volume, warnings, and failures. |
-| `reporting_thresholds` | One named reporting setting | Rebalancing thresholds can change without rewriting a SQL view. |
-
-The current-state table is synchronized from each successful full snapshot: a
-known vehicle is replaced, a new vehicle is inserted, and a vehicle absent from
-the accepted snapshot is removed. Historical rows use the run ID as part of
-their identity so retrying the same run does not create duplicates. Each affected
-15-minute grid bucket is replaced as a unit so it cannot mix multiple snapshots.
-Failed-quality snapshots remain auditable in detail but cannot replace current
-state or long-term aggregates. Environment rebalancing thresholds are synchronized
-to `reporting_thresholds` during the same transaction.
-
-The grid is a deterministic rectangular bucket calculated from latitude and
-longitude. It is intentionally simple. Its job is to compare observed supply by
-area, not to claim that the system has measured trips or predicted demand.
+Unit tests are deterministic and do not contact the live feed or configured production database. External checks are explicit through `fleet-diagnostics`; PostgreSQL integration uses an isolated CI service.
 
 ## Setup
 
-### 1. Create the Python environment
-
-From the repository root:
+Python 3.12 or newer is required.
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
+python -m pip install -r requirements-dev.lock
+python -m pip install --no-deps -e .
+Copy-Item .env.example .env
 ```
 
-### 2. Configure local settings
+Fill the required PostgreSQL values in `.env`. For a new database, apply `sql/001_schema.sql` through `sql/007_all_lime_gbfs_feeds.sql` in order. For an existing installation, take a backup and apply every numbered migration it has not yet received; migration 007 is required before deploying this four-feed application version.
 
-Create `.env` beside `README.md`, using `.env.example` as the list of keys. The
-loader finds this file from the repository location, so commands do not require
-manual environment-variable exports.
+The application never applies migrations automatically. Runtime credentials should not be able to change the schema.
 
-Required database settings are:
-
-```dotenv
-DB_HOST=your-supabase-host
-DB_PORT=5432
-DB_NAME=postgres
-DB_USER=postgres
-DB_PASSWORD=your-password
-```
-
-`GBFS_URL` has a public Seattle default. Blank optional values use their documented
-defaults; a blank `FEED_STALE_MINUTES` specifically leaves stale-feed detection
-disabled. Real `.env` values are secrets and must never be committed.
-
-### 3. Create the PostgreSQL objects
-
-Open the Supabase SQL Editor and run these files in order:
-
-```text
-sql/001_schema.sql
-sql/002_indexes.sql
-sql/003_views.sql
-sql/004_security.sql
-```
-
-This is a required one-time setup. A successful connection test proves that the
-credentials work; it does not create tables. If a test reports that
-`pipeline_runs` does not exist, the schema files have not yet been applied.
-
-For an existing database created with migrations 001-003, rerun `002_indexes.sql`
-to add the aggregate-retention index, rerun `003_views.sql`, and then run
-`004_security.sql`. The security migration revokes all table/view privileges from
-Supabase `anon` and `authenticated` roles and enables RLS without API policies.
-Apply it only when clients use the documented direct PostgreSQL connection;
-existing Supabase Data API clients will lose access.
-
-### 4. Verify the system
-
-Run deterministic unit tests:
+## Commands
 
 ```powershell
-python -m pytest
+# Deterministic local quality gate
+python -m ruff format --check src tests
+python -m ruff check src tests
+python -m mypy
+python -m pytest --cov=fleet_intelligence --cov-fail-under=90
+
+# Fetch, validate, assess, and transform without database access
+fleet-ingest --dry-run
+
+# Explicit read-only dependency checks
+fleet-diagnostics --live
+fleet-diagnostics --database
+fleet-diagnostics --live --database
+
+# One production ingestion
+fleet-ingest
+
+# Equivalent module entry point
+python -m fleet_intelligence
 ```
 
-Run the operator self-test, including the live API and database connection:
+`fleet-ingest --dry-run` is the safest four-feed preflight: it requires network access but no database credentials, validates and quality-checks every live document, transforms vehicle samples plus system/station samples, and logs counts without loading PostgreSQL. `fleet-diagnostics --live` validates that all four endpoints contain usable records. `fleet-diagnostics --database` is read-only and confirms that the original relations plus the five migration-007 tables and two new views exist. Plain `fleet-ingest` is the only command above that performs the production load.
 
-```powershell
-python -m src.self_test
-```
+A healthy live preflight includes `status=SUCCESS`, `system=lime_seattle`, nonzero station/status/vehicle counts, and normally zero rejections. Counts are live source observations and therefore vary between runs.
 
-Useful narrower checks are:
+## Configuration
 
-```powershell
-python -m src.self_test --skip-live
-python -m src.self_test --skip-db
-python -m src.self_test --verbose
-```
+Shell and CI variables override `.env`. Blank optional values use defaults.
 
-To exercise extract, validation, quality assessment, and transformation without
-writing anything to PostgreSQL:
+| Variable | Default | Purpose |
+|---|---:|---|
+| `SYSTEM_INFORMATION_URL` | `.../system_information.json` | System metadata source URL. |
+| `STATION_INFORMATION_URL` | `.../station_information.json` | Station definition source URL. |
+| `STATION_STATUS_URL` | `.../station_status.json` | Station supply/status source URL. |
+| `FREE_BIKE_STATUS_URL` | `.../free_bike_status.json` | Preferred free-vehicle source URL. |
+| `GBFS_URL` | Disabled legacy override | Backward-compatible free-vehicle URL used only when `FREE_BIKE_STATUS_URL` is blank or absent. |
+| `DB_HOST`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | Required | Dedicated ingestion login. |
+| `DB_PORT` | `5432` | PostgreSQL port. |
+| `DB_SSLMODE` | `require` | Allowed values: `require`, `verify-ca`, `verify-full`. |
+| `DB_CONNECT_TIMEOUT_SECONDS` | `10` | Initial connection timeout. |
+| `DB_STATEMENT_TIMEOUT_SECONDS` | `120` | Per-statement database timeout. |
+| `DETAIL_RETENTION_HOURS` | `24` | Vehicle-level forensic history. |
+| `AGGREGATE_RETENTION_DAYS` | `35` | Grid history used by weekday/time baselines and station-status snapshot history. |
+| `PIPELINE_RUN_RETENTION_DAYS` | `90` | Pipeline evidence and its cascading per-feed metric rows. |
+| `REJECTED_RETENTION_DAYS` | `14` | Quarantined source payloads. |
+| `FEED_STALE_MINUTES` | `10` | Source-age warning threshold applied independently to every feed. |
+| `VOLUME_DROP_THRESHOLD` | `0.50` | Fractional drop below the recent baseline. |
+| `VOLUME_DROP_POLICY` | `WARNING` | Whether a drop produces `WARNING` or `FAILED`. |
+| `GRID_SIZE_DEGREES` | `0.01` | Rectangular aggregation cell size. |
+| `REBALANCE_HIGH_THRESHOLD` | `10` | High-priority supply gap. |
+| `REBALANCE_MEDIUM_THRESHOLD` | `5` | Medium-priority supply gap. |
+| `SEATTLE_BBOX_MIN_LAT` and companions | Disabled | Optional complete four-coordinate acceptance boundary for vehicles and station definitions. |
 
-```powershell
-$env:FLEET_DRY_RUN="1"
-python -m src.main
-Remove-Item Env:FLEET_DRY_RUN
-```
+The four explicit endpoint variables are the preferred interface. For compatibility, free-bike URL precedence is `FREE_BIKE_STATUS_URL`, then legacy `GBFS_URL`, then the built-in Lime Seattle URL. Blank optional values from `.env` or GitHub secrets behave as absent and therefore use defaults.
 
-Use `python -m pytest tests/test_config.py` to run one test file. With Python's
-`-m` option, module names do not include `.py`; therefore
-`python -m tests.test_config.py` is not a valid command.
+## Upgrade and Deployment Contract
 
-### 5. Run one real ingestion
+Version `1.1.0` is the first four-feed release. Application code and schema migration 007 are a coordinated deployment: the new loader references migration-007 tables during every production run, including retention cleanup, so deploying the Python package before applying the migration will fail safely and leave the transaction rolled back.
 
-After the schema and `.env` are ready:
+| Deployment case | Required action | Why |
+|---|---|---|
+| New PostgreSQL/Supabase database | Apply migrations 001 through 007 in numeric order, then configure the ingestion login. | The Python process intentionally never creates or alters its own schema. |
+| Existing database already on 006 | Back up the database and apply only `007_all_lime_gbfs_feeds.sql` before updating the application. | Migration 007 is additive and preserves all established vehicle tables and view columns. |
+| Existing deployment using `GBFS_URL` | Keep the variable temporarily or migrate it to `FREE_BIKE_STATUS_URL`. | The compatibility fallback prevents an immediate configuration break while explicit feed names become the preferred interface. |
+| GitHub Actions deployment | Add the four endpoint secrets only when overriding the built-in Lime URLs; keep database credentials in repository secrets. | Blank endpoint secrets fall back to defaults, while database credentials remain required. |
 
-```powershell
-python -m src.main
-```
+Migration 007 is rerunnable: it uses conditional table/index creation, replaceable views, and conditional policy creation. It also applies count/coordinate/quality constraints, revokes public access, grants the new objects to `fleet_ingest`/`fleet_reporting`, enables RLS, and creates ingest policies consistent with migration 006.
 
-Run this from the activated `.venv`; alternatively, use
-`.\.venv\Scripts\python.exe -m src.main` explicitly. The command prints each
-pipeline stage and writes to the configured database. A successful run adds one
-row to `pipeline_runs`, adds vehicle-level history, synchronizes current state to
-the accepted full snapshot, replaces the affected 15-minute grid bucket, and
-updates reporting thresholds. Its reported duration includes database work.
+## Reporting Contract
 
-## Configuration Reference
-
-| Variable | Required | Default | Meaning |
-|---|---:|---:|---|
-| `GBFS_URL` | No | Lime Seattle feed | Source endpoint. |
-| `DB_HOST` | Yes | None | PostgreSQL/Supabase hostname. |
-| `DB_PORT` | No | `5432` | PostgreSQL port. |
-| `DB_NAME` | Yes | None | Database name. |
-| `DB_USER` | Yes | None | Database login user. |
-| `DB_PASSWORD` | Yes | None | Database login password. |
-| `DETAIL_RETENTION_DAYS` | No | `3` | Age at which vehicle snapshots, grid aggregates, and pipeline-run history are deleted. |
-| `REJECTED_RETENTION_DAYS` | No | `3` | Age at which rejected raw payloads are deleted. |
-| `FEED_STALE_MINUTES` | No | Disabled | Maximum acceptable source age. |
-| `VOLUME_DROP_THRESHOLD` | No | `0.50` | Fractional fall below recent normal volume that triggers QA. |
-| `VOLUME_DROP_POLICY` | No | `WARNING` | Whether a detected drop becomes `WARNING` or `FAILED`. |
-| `SEATTLE_BBOX_MIN_LAT` and companions | No | Disabled | Optional four-coordinate geographic acceptance boundary. |
-| `GRID_SIZE_DEGREES` | No | `0.01` | Width and height of the rectangular aggregation grid. |
-| `REBALANCE_HIGH_THRESHOLD` | No | `10` | High-priority supply-gap threshold synchronized to PostgreSQL each run. |
-| `REBALANCE_MEDIUM_THRESHOLD` | No | `5` | Medium-priority supply-gap threshold synchronized to PostgreSQL each run. |
-
-Shell or CI environment variables take precedence over values in `.env`. This
-lets local development use a file while GitHub Actions safely injects secrets.
-Blank optional CI values use the documented defaults. Unsafe values such as
-negative retention periods, invalid ports, reversed bounding boxes, or inverted
-rebalancing thresholds fail during startup before any database mutation.
-
-## GitHub Actions
-
-The workflow runs at `09:00` and `21:00` in the IANA
-`America/Los_Angeles` timezone, so daylight-saving transitions are handled
-automatically. It can also be started manually with `workflow_dispatch`. Add the
-variables from `.env.example` as GitHub Actions secrets. At minimum, add
-`DB_HOST`, `DB_NAME`, `DB_USER`, and `DB_PASSWORD`; `DB_PORT` defaults to `5432`.
-The workflow fixes both retention values at three days.
-
-The workflow runs pytest before ingestion. This prevents a known failing code
-change from writing a new snapshot. GitHub's scheduler is best-effort, so a job
-may start slightly after its nominal 9:00 AM or 9:00 PM trigger.
-
-## Power BI
-
-In Power BI Desktop, choose:
-
-```text
-Get Data -> PostgreSQL database -> DirectQuery
-```
-
-Connect to the same PostgreSQL database and build visuals from these views:
+Power BI reads stable views rather than operational tables:
 
 | View | Intended use |
 |---|---|
-| `vw_current_fleet_summary` | Fleet count, availability, latest source time, and latest pipeline state. |
-| `vw_current_grid_supply` | Current geographic supply and availability rate. |
-| `vw_grid_supply_baseline` | Typical supply by grid, Seattle-local weekday, and 15-minute time bucket. |
-| `vw_rebalancing_priority` | Current supply gap, including historically active grids with zero current vehicles, and availability-based operational priority. |
-| `vw_fleet_availability_trend` | Historical grid trends from compact aggregates. |
-| `vw_pipeline_health` | Recent success, warning, failure, latency, rejection, and freshness measures. |
+| `vw_current_fleet_summary` | Current fleet totals, availability, source freshness, and latest pipeline status. |
+| `vw_current_grid_supply` | Current vehicles and availability rate per geographic grid. |
+| `vw_grid_supply_baseline` | Typical supply for each grid, Seattle-local weekday, and 15-minute time slot. |
+| `vw_rebalancing_priority` | Current-versus-historical supply gap and `HIGH`/`MEDIUM`/`LOW` operational signal. |
+| `vw_fleet_availability_trend` | Compact historical availability trends. |
+| `vw_pipeline_health` | Recent run success, warnings, failures, latency, duration, rejection rate, and freshness. |
+| `vw_current_station_supply` | Current station metadata, vehicle/dock counts, and operating flags. |
+| `vw_feed_health` | Per-feed freshness, ingestion time, latency, and rejection rate over 24 hours. |
 
-Refresh Power BI after the twice-daily ingestion windows. Keep the interpretation
-precise: the dashboard shows availability observed at the latest scheduled
-snapshot and an availability-based rebalancing signal. It does not prove completed
-trips, measure demand directly, or represent continuous live state.
+Migration 005 appends `baseline_sample_count` and `baseline_ready` without renaming existing columns. Priority remains `LOW` until a grid/time context has at least four historical samples.
+
+`vw_current_station_supply` left-joins station definitions to current status so configured stations remain visible even if status is temporarily absent. `vw_feed_health` groups the last 24 hours by feed and exposes latest source/ingestion time, average endpoint latency, and rejection rate. These additions do not rename or remove any original reporting columns.
 
 ## Failure Semantics
 
-Invalid individual records are quarantined while valid records can continue.
-A snapshot with zero valid vehicles always fails. Missing state flags are rejected
-rather than interpreted as available, and Lime's `vehicle_type` field is preserved.
-A missing/stale timestamp or low-volume snapshot receives the configured quality status. A
-`FAILED` quality snapshot is preserved in detailed history and the run log but
-does not overwrite live current state or long-term grid aggregates. Snapshot
-writes, threshold synchronization, and retention cleanup occur in one transaction
-so reporting does not see partially updated state.
+- Invalid station and vehicle records are feed-tagged and quarantined while other valid records can continue; invalid required singleton system metadata fails validation for the run.
+- Missing, invalid, stale, or unexpectedly future source timestamps are assessed independently for every feed and produce at least a warning.
+- Zero valid vehicles, station definitions, or station statuses produces `FAILED`; the station feeds cannot be silently treated as optional.
+- Related-station rejections add a warning reason, and a more severe feed result always wins when feed qualities are merged.
+- Vehicle volume drops use the configured warning/failure policy but cannot downgrade an existing warning or failure.
+- `WARNING` snapshots atomically reconcile all current system/station/vehicle state and grid aggregates while retaining reasons and per-feed evidence.
+- A quality-`FAILED` snapshot that completed validation may write vehicle detail, station-status detail, feed metrics, and quarantine evidence, but it cannot replace any current system/station/vehicle state or grid aggregates.
+- An extraction or envelope exception aborts transformation/loading; when PostgreSQL is already connected, the pipeline attempts to record a sanitized failed-run row.
+- Database write failures roll back the complete snapshot transaction.
+- If PostgreSQL is unreachable, the workflow log and nonzero exit code are the only available failure evidence.
 
-Supabase `anon` and `authenticated` roles have no privileges on these tables or
-views, and row-level security is enabled as defense in depth. The ETL and Power BI
-DirectQuery use the explicitly configured PostgreSQL login.
+## Capacity and Operational Safety
 
-If the database itself is unavailable, Python cannot record the failure there;
-the nonzero process exit and GitHub Actions log are then the authoritative error
-record.
+At roughly 13,000 vehicles every 15 minutes, the balanced retention defaults are expected to use approximately 0.7–1.0 GB including indexes. Station-status history and four small feed-metric rows per run add comparatively little volume. Reduce vehicle detail retention before aggregate retention if capacity is constrained: multi-week grid aggregates are necessary for weekday/time baselines, while station-status history shares that aggregate retention window.
 
-## Current Scope
+Use a schema-owner login only for migrations. Use a member of `fleet_ingest` for the scheduled job and a different member of `fleet_reporting` for Power BI. Credentials and role passwords belong in a secret manager, never in SQL files or Git.
 
-This is an MVP built around one Lime Seattle free-bike-status feed, a rectangular
-grid, PostgreSQL, and Power BI DirectQuery. It does not include confirmed trip
-events, predictive demand modeling, alert delivery, or a deployed Power BI file.
-Those are extensions of the system, not assumptions hidden inside the current
-implementation.
+The detailed migration, verification, sizing, troubleshooting, and rollback procedures are in [the operations runbook](docs/operations.md).
+
+## Scope
+
+This repository covers four related Lime GBFS sources, validation and quarantine, PostgreSQL persistence, operational quality, bounded retention, least-privilege access, and stable reporting views. Alert delivery, trip inference, predictive demand modeling, and a deployed Power BI artifact are intentionally out of scope.

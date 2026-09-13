@@ -1,6 +1,4 @@
-# Runtime dependencies
-requests==2.32.3
-psycopg[binary]==3.2.3
-
-# Test dependencies
-pytest==8.3.4
+# Runtime dependencies. Keep these synchronized with pyproject.toml.
+psycopg[binary]==3.3.4
+python-dotenv==1.2.3
+requests==2.34.2

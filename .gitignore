@@ -1,7 +1,30 @@
-.venv/
 .env
+.venv/
+
+# Python build and interpreter output
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Test, coverage, and static-analysis output
 .pytest_cache/
+.pytest_tmp/
 .test_tmp*/
-.review_test_tmp/
+.*test-tmp/
+.*_tests/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# PBI
+PBI/
