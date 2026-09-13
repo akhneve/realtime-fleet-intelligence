@@ -12,6 +12,7 @@ dependencies = [
     "psycopg[binary]==3.3.4",
     "python-dotenv==1.2.3",
     "requests==2.34.2",
+    "shapely==2.1.2",
 ]
 
 [project.optional-dependencies]
@@ -61,4 +62,4 @@ python_version = "3.12"
 strict = true
 warn_unreachable = true
 pretty = true
-packages = ["fleet_intelligence"]
+files = ["src", "scripts"]

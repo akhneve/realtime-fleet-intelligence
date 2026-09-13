@@ -2,3 +2,4 @@
 psycopg[binary]==3.3.4
 python-dotenv==1.2.3
 requests==2.34.2
+shapely==2.1.2

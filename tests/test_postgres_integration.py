@@ -174,6 +174,22 @@ def test_migrations_loading_views_and_rollback() -> None:
         assert conn.execute("select count(*) from vw_current_station_supply").fetchone()[0] == 1
         assert conn.execute("select count(*) from fact_station_status_snapshot").fetchone()[0] == 1
         assert conn.execute("select count(*) from feed_run_metrics").fetchone()[0] == 4
+        enriched = conn.execute(
+            """
+            select
+                neighborhood_name,
+                zip_code,
+                council_district_name,
+                grid_id,
+                source_timestamp,
+                ingestion_timestamp
+            from vw_vehicle_geography_enriched
+            where vehicle_id = 'vehicle-1'
+            """
+        ).fetchone()
+        assert enriched is not None
+        assert enriched[:4] == (None, None, None, None)
+        assert enriched[4:] == (timestamp, timestamp)
 
         bad_run = PipelineRun(
             "00000000-0000-0000-0000-000000000002",

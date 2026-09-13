@@ -83,6 +83,38 @@ Each endpoint keeps its native grain through validation and transformation. The 
 
 All endpoint URLs must be absolute HTTPS URLs. Extraction reuses one HTTP session but records latency, HTTP status, source timestamp, source URL, counts, and observed keys independently for each feed in `feed_run_metrics`. A failure identifies the feed by name and aborts the four-feed refresh.
 
+## Seattle Geography Enrichment
+
+Static public boundaries are loaded once initially and refreshed when the source data changes. Live vehicle coordinates are enriched in PostgreSQL, not in Power BI, through `lookup_vehicle_geography(longitude, latitude)` and `vw_vehicle_geography_enriched`.
+
+| Source | Properties observed | Source features | Loaded dimension rows |
+|---|---|---:|---:|
+| [Neighborhoods](https://raw.githubusercontent.com/seattleio/seattle-boundaries-data/master/data/neighborhoods.geojson) | `area`, `city`, `county`, `name`, `nested`, `nhood` | 175 | 90 Seattle rows in `dim_neighborhood` |
+| [ZIP codes](https://raw.githubusercontent.com/seattleio/seattle-boundaries-data/master/data/zip-codes.geojson) | `AFFGEOID10`, `ALAND10`, `AWATER10`, `GEOID10`, `ZCTA5CE10` | 32 | 32 rows in `dim_zip_area` |
+| [City council districts](https://raw.githubusercontent.com/seattleio/seattle-boundaries-data/master/data/city-council-districts.geojson) | `district` | 7 | 7 rows in `dim_council_district` |
+
+The neighborhood file is King County-wide despite its filename. The loader validates all 175 geometries, explicitly logs 85 non-Seattle scope exclusions, and loads the 90 records whose `city` property is `Seattle`. The source currently contains 57 topologically invalid neighborhood polygons. Each is logged with its validity reason, repaired with Shapely, normalized to `MultiPolygon`, and revalidated; an unrecoverable feature fails and rolls back the entire load rather than being silently dropped.
+
+Migration 008 enables PostGIS, stores every polygon as `geometry(MultiPolygon, 4326)`, adds GiST indexes, and derives `dim_grid` from 0.01-degree cells clipped to the union of council districts. The grid formula is the same one used by `assign_grid_id`. Keep `GEOGRAPHY_GRID_SIZE_DEGREES` equal to `GRID_SIZE_DEGREES` if either setting is changed.
+
+The council union is the city mask. A vehicle must match that mask before any neighborhood, ZIP, or grid is returned, so records outside Seattle produce four null geography values. `ST_Covers` includes points exactly on polygon boundaries. Lateral lookups select at most one row per dimension, preventing overlapping source polygons from duplicating vehicle facts.
+
+The `refresh-seattle-geography` GitHub Actions workflow runs on the first day of every month at 09:17 UTC and can also be started with `workflow_dispatch`. Run the geography loader separately from the 15-minute vehicle pipeline because these boundaries change infrequently:
+
+```powershell
+# Validates HTTP responses, feature properties, topology, and expected counts; no DB writes.
+python scripts/ingest_geography.py --dry-run
+
+# Idempotent atomic upsert, stale-row reconciliation, grid refresh, and database verification.
+python scripts/ingest_geography.py
+```
+
+The database run verifies nonempty dimensions, valid geometry, SRID 4326, all four spatial indexes, a downtown Seattle lookup, and a far-outside lookup. The checked deployment output is recorded in [docs/geography_verification.md](docs/geography_verification.md).
+
+Every successful upsert stores a UTC `loaded_at` value on each dimension row. `vw_geography_refresh_status` summarizes this as `last_successful_update`, row count, and elapsed time for each table. Because all writes are atomic, a failed refresh rolls back and leaves the prior successful update date intact.
+
+Ready-to-run SQL is in [sql/examples/verify_geography.sql](sql/examples/verify_geography.sql) and [sql/examples/power_bi_geography.sql](sql/examples/power_bi_geography.sql). Files under `sql/examples/` are operator queries, not migrations.
+
 ## Why the Database Has Several Tables
 
 One table cannot efficiently represent every grain of information:
@@ -117,7 +149,7 @@ The same run is intentionally represented at different grains. Current-state tab
 | `requirements.lock` | Pins the fully resolved runtime environment, including transitive dependencies. | A scheduled job should install the same versions on every runner rather than resolving a different environment over time. | Reproducible production and scheduled-workflow installation. |
 | `requirements-dev.txt` | Adds Mypy, pytest, coverage, and Ruff to the runtime requirements. | Contributors need development tools that production does not need. | Human-readable local development dependency manifest. |
 | `requirements-dev.lock` | Pins the complete resolved development and CI environment. | CI and local verification must use predictable tool versions. | Reproducible quality-gate installation. |
-| `.env.example` | Lists the four explicit Lime endpoint settings plus database, retention, quality, bounding-box, grid, and reporting settings with safe defaults. | It documents the expanded configuration interface without exposing credentials. | Template for local `.env` and GitHub secrets. |
+| `.env.example` | Lists the four Lime endpoints plus database, retention, quality, bounding-box, operational-grid, geography-grid, and reporting settings with safe defaults. | It documents the expanded configuration interface without exposing credentials. | Template for local `.env` and GitHub secrets. |
 | `.gitignore` | Excludes secrets, virtual environments, bytecode, build output, coverage data, test output, tool caches, and the local Power BI workspace. | Machine-specific, binary, and generated files create noise, cannot be reviewed usefully as text diffs, and can leak connection metadata. | Repository hygiene and secret-protection boundary. |
 
 ### Local-only artifacts
@@ -137,6 +169,7 @@ These paths are part of a developer's working system but are intentionally ignor
 |---|---|---|---|
 | `.github/workflows/ci.yml` | Runs formatting, linting, strict typing, coverage-enforced tests, and PostgreSQL integration tests on Python 3.12 and 3.13. | A change should prove deterministic correctness before reaching the scheduled production workflow. | Pull-request and main-branch quality gate. |
 | `.github/workflows/ingest.yml` | Installs runtime-only dependencies, supplies all four endpoint settings and the legacy free-bike override, and executes `fleet-ingest` every 15 minutes or on manual dispatch. | The pipeline needs an external clock, deployment configuration, and visible execution history. | Production scheduler and runtime environment. |
+| `.github/workflows/geography.yml` | Runs the static geography loader on the first day of every month and supports manual dispatch. | Boundary classifications need a regular freshness check without joining the 15-minute feed workload. | Monthly geography refresh and verification schedule. |
 | `.github/dependabot.yml` | Checks Python and GitHub Actions dependencies weekly and groups related updates. | Exact pins become unsafe if nobody reviews newer security and compatibility releases. | Dependency maintenance automation. |
 
 CI and ingestion are intentionally separate. Tests should be deterministic and run on code changes; live ingestion should be small, fast, and concerned only with one atomic four-feed production snapshot.
@@ -147,6 +180,13 @@ CI and ingestion are intentionally separate. Tests should be deterministic and r
 |---|---|---|---|
 | `docs/architecture.md` | Describes module boundaries, typed contracts, transaction invariants, reporting semantics, and security boundaries. | Maintainers need the reasoning behind boundaries, not just setup commands. | Engineering design reference. |
 | `docs/operations.md` | Documents migrations, role provisioning, deployment checks, sizing, troubleshooting, and rollback. | Operating a data pipeline safely requires procedures that do not belong inside application code. | Production runbook. |
+| `docs/geography_verification.md` | Records the checked source schemas, repair counts, loaded row counts, indexes, SRIDs, and sample lookup results. | The deployed spatial layer needs reproducible evidence beyond a successful process exit. | Geography deployment evidence. |
+
+### Static geography ingestion
+
+| File | What it does | Why it is needed | Where it fits |
+|---|---|---|---|
+| `scripts/ingest_geography.py` | Downloads all three boundary files with retries, validates every feature, repairs and normalizes polygons, atomically upserts the dimensions, reconciles stale rows, refreshes the clipped grid, and runs database checks. | Slow-changing boundaries need an idempotent owner separate from the high-frequency GBFS pipeline. | On-demand or scheduled static reference-data load. |
 
 ### Python package
 
@@ -182,8 +222,10 @@ Migrations are applied in numerical order. They are deliberately separate from r
 | `sql/005_production_hardening.sql` | Adds validated coordinate/count/quality constraints and updates baseline/rebalancing views to expose sample readiness and use the latest snapshot's time context. | Application validation is not enough by itself; the database must defend its invariants, and stale snapshots must not be compared with the viewer's wall clock. | Additive integrity and reporting-correctness migration for existing installations. |
 | `sql/006_least_privilege_roles.sql` | Creates non-login ingestion/reporting roles, hardens public/default privileges, grants minimal access, and installs ingestion RLS policies. | Runtime writers and reporting readers require different privileges, while credentials remain deployment-specific. | Additive least-privilege authorization model. |
 | `sql/007_all_lime_gbfs_feeds.sql` | Adds a feed name to quarantined records; creates five system/station/feed-metric tables, station/feed indexes, `vw_current_station_supply`, and `vw_feed_health`; and extends constraints, grants, RLS, and ingest policies. | Existing free-bike deployments need an additive, idempotent path to ingest the other three Lime datasets without rebuilding established vehicle objects. | Four-feed storage, observability, reporting, and security extension. |
+| `sql/008_geography_enrichment.sql` | Enables PostGIS; creates neighborhood, ZIP, council, and clipped-grid dimensions; adds GiST indexes; and defines refresh, lookup, and enriched-vehicle interfaces with least-privilege access. | Coordinates need stable server-side spatial attributes so reports do not guess geography or multiply vehicle rows. | Static geography dimension and Power BI semantic layer. |
+| `sql/009_geography_refresh_status.sql` | Exposes the stored per-row load timestamps as a per-dimension last-success status view. | Operators and Power BI need a durable freshness date that does not advance when a load fails. | Geography refresh monitoring layer. |
 
-The first four migrations remain the compatibility baseline. Existing databases apply 005, 006, and 007 rather than rebuilding tables or changing established Power BI columns.
+The first four migrations remain the compatibility baseline. Existing databases apply 005 through 009 rather than rebuilding tables or changing established Power BI columns.
 
 ### Automated tests
 
@@ -196,7 +238,7 @@ The first four migrations remain the compatibility baseline. Existing databases 
 | `tests/test_load.py` | TLS/timeouts, vehicle `COPY` staging, idempotent system/station/status/feed-metric SQL, feed-tagged rejections, retention, failed-snapshot isolation, and transactions. | Persistence bugs can silently produce plausible but inconsistent cross-feed dashboards. | Database-boundary unit coverage with recording fakes. |
 | `tests/test_main.py` | Four-feed orchestration and metric creation, related-feed severity escalation, exit statuses, retention propagation, final duration, secret sanitization, connection cleanup, dry-run isolation, and CLI switching. | Orchestration must remain correct when any individual feed or stage fails. | Application-flow regression coverage. |
 | `tests/test_diagnostics.py` | Read-only database behavior, four-feed live validation, empty vehicle failure, CLI target selection, and diagnostic exit status. | Operator tools must not mutate production and must fail clearly when any required dependency is unusable. | Diagnostic-command unit coverage. |
-| `tests/test_sql.py` | Migration ordering through 007, additive constraints, station/feed tables and views, snapshot-time context, baseline readiness, least-privilege roles, and RLS policies. | Important behavior lives in SQL and needs reviewable regression guards even without a database process. | Static migration contract coverage. |
+| `tests/test_sql.py` | Migration ordering through 009, additive constraints, station/feed/geography tables and views, spatial indexes, refresh timestamps, snapshot-time context, baseline readiness, least-privilege roles, and RLS policies. | Important behavior lives in SQL and needs reviewable regression guards even without a database process. | Static migration contract coverage. |
 | `tests/test_automation.py` | All four workflow endpoint variables, the 15-minute schedule, workflow permissions/timeouts, CI Python matrix, PostgreSQL service, coverage gate, and immutable action pins. | Automation configuration is executable production behavior, not incidental YAML. | CI/deployment regression coverage. |
 | `tests/test_postgres_integration.py` | Applies every migration twice, transactionally loads all four normalized datasets and metrics, queries vehicle/station views, verifies constraint rollback, and checks ingestion/reporting privileges. | Fakes cannot prove that PostgreSQL accepts the cross-feed SQL, deferred feed-metric relationship, or role semantics. | Real PostgreSQL integration test, enabled by `TEST_DATABASE_URL`. |
 
@@ -214,7 +256,7 @@ python -m pip install --no-deps -e .
 Copy-Item .env.example .env
 ```
 
-Fill the required PostgreSQL values in `.env`. For a new database, apply `sql/001_schema.sql` through `sql/007_all_lime_gbfs_feeds.sql` in order. For an existing installation, take a backup and apply every numbered migration it has not yet received; migration 007 is required before deploying this four-feed application version.
+Fill the required PostgreSQL values in `.env`. For a new database, apply `sql/001_schema.sql` through `sql/009_geography_refresh_status.sql` in order. For an existing installation, take a backup and apply every numbered migration it has not yet received. Migration 007 is required before deploying this four-feed application version, migration 008 is required before running the geography loader, and migration 009 exposes its last-success timestamps.
 
 The application never applies migrations automatically. Runtime credentials should not be able to change the schema.
 
@@ -222,8 +264,8 @@ The application never applies migrations automatically. Runtime credentials shou
 
 ```powershell
 # Deterministic local quality gate
-python -m ruff format --check src tests
-python -m ruff check src tests
+python -m ruff format --check src tests scripts
+python -m ruff check src tests scripts
 python -m mypy
 python -m pytest --cov=fleet_intelligence --cov-fail-under=90
 
@@ -262,6 +304,7 @@ Shell and CI variables override `.env`. Blank optional values use defaults.
 | `DB_SSLMODE` | `require` | Allowed values: `require`, `verify-ca`, `verify-full`. |
 | `DB_CONNECT_TIMEOUT_SECONDS` | `10` | Initial connection timeout. |
 | `DB_STATEMENT_TIMEOUT_SECONDS` | `120` | Per-statement database timeout. |
+| `GEOGRAPHY_GRID_SIZE_DEGREES` | `0.01` | Grid-cell size used by `refresh_dim_grid`; keep equal to `GRID_SIZE_DEGREES`. |
 | `DETAIL_RETENTION_HOURS` | `24` | Vehicle-level forensic history. |
 | `AGGREGATE_RETENTION_DAYS` | `35` | Grid history used by weekday/time baselines and station-status snapshot history. |
 | `PIPELINE_RUN_RETENTION_DAYS` | `90` | Pipeline evidence and its cascading per-feed metric rows. |
@@ -282,12 +325,16 @@ Version `1.1.0` is the first four-feed release. Application code and schema migr
 
 | Deployment case | Required action | Why |
 |---|---|---|
-| New PostgreSQL/Supabase database | Apply migrations 001 through 007 in numeric order, then configure the ingestion login. | The Python process intentionally never creates or alters its own schema. |
-| Existing database already on 006 | Back up the database and apply only `007_all_lime_gbfs_feeds.sql` before updating the application. | Migration 007 is additive and preserves all established vehicle tables and view columns. |
+| New PostgreSQL/Supabase database | Apply migrations 001 through 009 in numeric order, then configure the ingestion login. | Python ingestion intentionally never creates or alters its own schema. |
+| Existing database already on 006 | Back up the database and apply migrations 007, 008, and 009 in order before updating the application. | All three migrations are additive and preserve established vehicle table columns. |
 | Existing deployment using `GBFS_URL` | Keep the variable temporarily or migrate it to `FREE_BIKE_STATUS_URL`. | The compatibility fallback prevents an immediate configuration break while explicit feed names become the preferred interface. |
 | GitHub Actions deployment | Add the four endpoint secrets only when overriding the built-in Lime URLs; keep database credentials in repository secrets. | Blank endpoint secrets fall back to defaults, while database credentials remain required. |
 
 Migration 007 is rerunnable: it uses conditional table/index creation, replaceable views, and conditional policy creation. It also applies count/coordinate/quality constraints, revokes public access, grants the new objects to `fleet_ingest`/`fleet_reporting`, enables RLS, and creates ingest policies consistent with migration 006.
+
+Migration 008 is also rerunnable. Apply it as the schema owner, then run `scripts/ingest_geography.py` with an ingestion login. PostGIS extension creation is intentionally a migration responsibility rather than a runtime privilege.
+
+Migration 009 is rerunnable and adds only the reporting status view. The monthly workflow assumes migrations 008 and 009 are already deployed; it never grants itself schema-changing privileges.
 
 ## Reporting Contract
 
@@ -303,10 +350,54 @@ Power BI reads stable views rather than operational tables:
 | `vw_pipeline_health` | Recent run success, warnings, failures, latency, duration, rejection rate, and freshness. |
 | `vw_current_station_supply` | Current station metadata, vehicle/dock counts, and operating flags. |
 | `vw_feed_health` | Per-feed freshness, ingestion time, latency, and rejection rate over 24 hours. |
+| `vw_vehicle_geography_enriched` | Vehicle snapshots enriched with one neighborhood, ZIP, council district, and Seattle-clipped grid ID. |
+| `vw_geography_refresh_status` | Row counts and stored last-successful-update timestamps for each geography dimension. |
 
 Migration 005 appends `baseline_sample_count` and `baseline_ready` without renaming existing columns. Priority remains `LOW` until a grid/time context has at least four historical samples.
 
 `vw_current_station_supply` left-joins station definitions to current status so configured stations remain visible even if status is temporarily absent. `vw_feed_health` groups the last 24 hours by feed and exposes latest source/ingestion time, average endpoint latency, and rejection rate. These additions do not rename or remove any original reporting columns.
+
+### Power BI geography queries
+
+Use the enriched view as the vehicle-detail source. Its four text geography columns can be used directly as slicers:
+
+```sql
+select
+    vehicle_id,
+    snapshot_timestamp,
+    latitude,
+    longitude,
+    available_flag,
+    neighborhood_name,
+    zip_code,
+    council_district_name,
+    grid_id,
+    source_timestamp,
+    ingestion_timestamp
+from vw_vehicle_geography_enriched;
+```
+
+A compact dataset for availability visuals and slicers is:
+
+```sql
+select
+    snapshot_timestamp,
+    neighborhood_name,
+    zip_code,
+    council_district_name,
+    grid_id,
+    count(*) as total_vehicles,
+    count(*) filter (where available_flag) as available_vehicles
+from vw_vehicle_geography_enriched
+group by 1, 2, 3, 4, 5;
+```
+
+Test a downtown point and an out-of-city point directly:
+
+```sql
+select * from lookup_vehicle_geography(-122.3321, 47.6062);
+select * from lookup_vehicle_geography(-74.0060, 40.7128);
+```
 
 ## Failure Semantics
 

@@ -19,7 +19,7 @@ jobs:
 
     services:
       postgres:
-        image: postgres:17
+        image: postgis/postgis:17-3.5
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -52,10 +52,10 @@ jobs:
           python -m pip install --disable-pip-version-check --no-deps -e .
 
       - name: Check formatting
-        run: python -m ruff format --check src tests
+        run: python -m ruff format --check src tests scripts
 
       - name: Lint
-        run: python -m ruff check src tests
+        run: python -m ruff check src tests scripts
 
       - name: Type check
         run: python -m mypy
