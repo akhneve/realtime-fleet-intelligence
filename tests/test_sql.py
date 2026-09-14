@@ -33,6 +33,14 @@ def test_hardening_adds_constraints_and_snapshot_context() -> None:
     assert "count(*) >= 4" in migration
 
 
+def test_base_views_keep_hardened_shape_for_full_migration_reruns() -> None:
+    migration = sql("003_views.sql")
+    assert "snapshot_context as" in migration
+    assert "baseline_sample_count" in migration
+    assert "baseline_ready" in migration
+    assert "count(*) >= 4" in migration
+
+
 def test_least_privilege_roles_and_rls_policy_exist() -> None:
     migration = sql("006_least_privilege_roles.sql")
     assert "create role fleet_ingest nologin" in migration

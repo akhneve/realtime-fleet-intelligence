@@ -33,7 +33,9 @@ select
     avg(available_vehicles)::numeric(12, 2) as avg_available_vehicles, -- Mean available supply used as the initial baseline metric.
     percentile_cont(0.5) within group (order by available_vehicles) as median_available_vehicles, -- Median provides a robust comparison when supply has outliers.
     percentile_cont(0.25) within group (order by available_vehicles) as p25_available_vehicles, -- Lower quartile helps understand normal low-supply ranges.
-    percentile_cont(0.75) within group (order by available_vehicles) as p75_available_vehicles -- Upper quartile helps understand normal high-supply ranges.
+    percentile_cont(0.75) within group (order by available_vehicles) as p75_available_vehicles, -- Upper quartile helps understand normal high-supply ranges.
+    count(*)::integer as baseline_sample_count, -- Makes sparse baselines visible to downstream consumers.
+    count(*) >= 4 as baseline_ready -- Prevents a small sample from being presented as an established pattern.
 from fact_grid_15min
 group by grid_id, day_of_week, bucket_15min_index; -- Groups by comparable location and time context.
 
@@ -44,20 +46,26 @@ with current_supply as (
     -- Starts from the current grid supply view so priority logic reuses the same latest-snapshot definitions as the dashboard.
     select * from vw_current_grid_supply
 ),
+snapshot_context as (
+    -- Current state can be hours old; score it against its own local time bucket.
+    select coalesce(max(source_timestamp), max(ingestion_timestamp), now()) as context_timestamp
+    from current_vehicle_state
+),
 latest_context as (
-    -- Captures the current day/time bucket so current supply is compared to the right historical context.
+    -- Captures the snapshot day/time bucket so delayed runs are compared with the right context.
     select
-        extract(dow from now() at time zone 'America/Los_Angeles')::integer as day_of_week,
-        (date_part('hour', now() at time zone 'America/Los_Angeles')::integer * 60
-            + date_part('minute', now() at time zone 'America/Los_Angeles')::integer) / 15 as bucket_15min_index
+        extract(dow from context_timestamp at time zone 'America/Los_Angeles')::integer as day_of_week,
+        (date_part('hour', context_timestamp at time zone 'America/Los_Angeles')::integer * 60
+            + date_part('minute', context_timestamp at time zone 'America/Los_Angeles')::integer) / 15 as bucket_15min_index
+    from snapshot_context
 ),
 context_baseline as (
     -- Narrows the historical baseline to the current Seattle-local weekday and time bucket.
-    select b.*
-    from vw_grid_supply_baseline b
-    cross join latest_context lc
-    where b.day_of_week = lc.day_of_week
-      and b.bucket_15min_index = lc.bucket_15min_index
+    select baseline.*
+    from vw_grid_supply_baseline baseline
+    cross join latest_context context
+    where baseline.day_of_week = context.day_of_week
+      and baseline.bucket_15min_index = context.bucket_15min_index
 ),
 thresholds as (
     -- Pulls priority thresholds from a table so users can tune cutoffs without editing SQL view code.
@@ -73,21 +81,26 @@ candidate_grids as (
     select grid_id from context_baseline
 )
 select
-    g.grid_id, -- Grid being scored for rebalancing priority.
-    coalesce(c.available_vehicles, 0) as current_available_vehicles, -- Missing current grids represent zero observed supply.
-    b.avg_available_vehicles as historical_typical_available_vehicles, -- Typical available supply for this grid and time bucket.
-    coalesce(b.avg_available_vehicles, 0) - coalesce(c.available_vehicles, 0) as supply_gap, -- Positive values mean current supply is below baseline.
-    coalesce(c.availability_rate, 0) as availability_rate, -- A historically active grid with no current vehicles has zero availability.
+    grids.grid_id, -- Grid being scored for rebalancing priority.
+    coalesce(current.available_vehicles, 0) as current_available_vehicles, -- Missing current grids represent zero observed supply.
+    baseline.avg_available_vehicles as historical_typical_available_vehicles, -- Typical available supply for this grid and time bucket.
+    coalesce(baseline.avg_available_vehicles, 0) - coalesce(current.available_vehicles, 0) as supply_gap, -- Positive values mean current supply is below baseline.
+    coalesce(current.availability_rate, 0) as availability_rate, -- A historically active grid with no current vehicles has zero availability.
     case
-        when coalesce(b.avg_available_vehicles, 0) - coalesce(c.available_vehicles, 0) >= t.high_threshold then 'HIGH' -- Flags large below-baseline gaps for immediate attention.
-        when coalesce(b.avg_available_vehicles, 0) - coalesce(c.available_vehicles, 0) >= t.medium_threshold then 'MEDIUM' -- Flags moderate below-baseline gaps for review.
+        when not coalesce(baseline.baseline_ready, false) then 'LOW'
+        when coalesce(baseline.avg_available_vehicles, 0) - coalesce(current.available_vehicles, 0)
+            >= thresholds.high_threshold then 'HIGH' -- Flags large below-baseline gaps for immediate attention.
+        when coalesce(baseline.avg_available_vehicles, 0) - coalesce(current.available_vehicles, 0)
+            >= thresholds.medium_threshold then 'MEDIUM' -- Flags moderate below-baseline gaps for review.
         else 'LOW' -- Keeps all other grids visible without overstating urgency.
     end as priority,
-    'Suggested operational rebalancing signal based on observed availability patterns.' as interpretation -- Prevents the dashboard from presenting this as demand prediction.
-from candidate_grids g
-cross join thresholds t -- Adds the single threshold row to every current grid.
-left join current_supply c on c.grid_id = g.grid_id
-left join context_baseline b on b.grid_id = g.grid_id;
+    'Suggested operational rebalancing signal based on observed availability patterns.' as interpretation, -- Prevents the dashboard from presenting this as demand prediction.
+    coalesce(baseline.baseline_sample_count, 0) as baseline_sample_count,
+    coalesce(baseline.baseline_ready, false) as baseline_ready
+from candidate_grids grids
+cross join thresholds -- Adds the single threshold row to every current grid.
+left join current_supply current on current.grid_id = grids.grid_id
+left join context_baseline baseline on baseline.grid_id = grids.grid_id;
 
 -- Exposes compact historical supply trends for Power BI.
 -- This keeps trend visuals fast by reading pre-aggregated 15-minute grid metrics.
