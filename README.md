@@ -1,8 +1,8 @@
-# Real-Time Fleet Operations Intelligence: Analyst Onboarding
+# Real-Time Fleet Operations Intelligence
 
 This repository turns four Lime Seattle availability feeds into validated PostgreSQL data and reporting views for Power BI. It schedules an observation every 15 minutes and refreshes Seattle boundary data monthly. Its purpose is to explain **observed fleet supply, availability, geography, and pipeline health**.
 
-This guide is for a Data Analyst who knows basic spreadsheets or SQL and wants to understand, investigate, and eventually change the whole pipeline. You do not need to know Python beforehand. The explanations introduce concepts first; the file catalog and change handbook provide engineering detail when needed.
+This guide is for anyone who knows basic spreadsheets or SQL and wants to understand the whole pipeline. You do not need to know Python beforehand. The explanations introduce concepts first; the file catalog and change handbook provide engineering detail when needed.
 
 The source and migrations define behavior. This guide describes package `1.1.0`, migrations 001–009, and all 49 tracked files in this checkout. Recorded geography verification is historical evidence, not a live health check. Worked examples are synthetic. No production database or feed was accessed to prepare this guide.
 
@@ -26,13 +26,13 @@ The source and migrations define behavior. This guide describes package `1.1.0`,
 
 ## How to use this guide
 
-| Your task | Read first | Learning outcome |
-|---|---|---|
-| First day | First principles, diagrams, worked observation | Explain what one row means, where it comes from, and what it cannot prove. |
-| First analysis | Database dictionary, reporting rules, queries | Choose a view and time filter without inflating counts. |
-| First local run | Setup, configuration, quality behavior | Distinguish commands that read data from commands that write it. |
-| First change | Change handbook, walkthroughs, testing/deployment | Identify definitions, mappings, permissions, and tests that must move together. |
-| An incident | Troubleshooting, then the relevant file entry | Trace a dashboard symptom back to a source or run. |
+| Topic | Description |
+|---|---|
+| First principles, diagrams, worked observation | Explain what one row means, where it comes from, and what it cannot prove. |
+| Database dictionary, reporting rules, queries | Choose a view and time filter without inflating counts. |
+| Setup, configuration, quality behavior | Distinguish commands that read data from commands that write it. |
+| Change handbook, walkthroughs, testing/deployment | Identify definitions, mappings, permissions, and tests that must move together. |
+| Troubleshooting, then the relevant file entry | Trace a dashboard symptom back to a source or run. |
 
 A clone contains code, not production data or credentials. Obtain reporting access and connection details from the deployment owner. Normal analysis needs read access; testing writes belongs in a separate development database.
 
@@ -998,14 +998,6 @@ Start with the relevant public function, then follow its calls. In `main.py`, `r
 `with conn.transaction():` marks the write boundary. `with conn.cursor():` manages the query cursor; it does not alone define an atomic whole-run transaction. `%s` placeholders plus a separate tuple pass SQL **values** safely through Psycopg; do not interpolate source strings into SQL. Controlled table-name loops in the geography script are different from arbitrary user-provided identifiers.
 
 `on conflict ... do nothing` preserves an existing same-key fact, whereas `do update` replaces specified fields. `delete ... where run_id <> ...` reconciles current state. An ordinary new CLI invocation generates a new UUID, so the same source publication can legitimately produce another set of detail facts. Same-key detail deduplication does not imply whole-pipeline exactly-once execution: quarantine inserts create new rejection IDs on repeats.
-
-### First-week exercises
-
-1. Without running anything, explain which view answers “available vehicles now” and which answers “supply last Tuesday at this time.” State each grain and timestamp.
-2. Run the offline tests and synthetic transform example locally; explain why that does not prove live feed or database health.
-3. With reporting access, inspect summary/feed health and a trend bucket. Calculate a weighted availability rate and explain a null value.
-4. Trace one field from validation through model, transform, COPY mapping, table and view. List the tests you would change if its meaning changed.
-5. Draft a small same-shape SQL formula change using the median walkthrough. Explain how an existing database receives it and why replaying all migrations must still work.
 
 ## Known limitations and documentation maintenance
 
