@@ -1,5 +1,5 @@
 # Runtime dependencies. Keep these synchronized with pyproject.toml.
-psycopg[binary]==3.3.4
+psycopg[binary]==3.3.5
 python-dotenv==1.2.3
 requests==2.34.2
 shapely==2.1.2
