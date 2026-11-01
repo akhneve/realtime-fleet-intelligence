@@ -9,18 +9,18 @@ description = "A production-oriented multi-feed GBFS pipeline for fleet operatio
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "psycopg[binary]==3.3.4",
-    "python-dotenv==1.2.3",
+    "psycopg[binary]==3.3.6",
+    "python-dotenv==1.2.4",
     "requests==2.34.2",
-    "shapely==2.1.2",
+    "shapely==2.2.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "mypy==2.3.1",
-    "pytest==9.1.1",
+    "mypy==2.4.1",
+    "pytest==9.2.0",
     "pytest-cov==7.1.0",
-    "ruff==0.16.4",
+    "ruff==0.17.3",
 ]
 
 [project.scripts]
